@@ -25,5 +25,5 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: 'cidr_page' # 必须与你在 CF Pages 创建的项目名称完全一致
+          projectName: 'cidrs' # 必须与你在 CF Pages 创建的项目名称完全一致
           directory: 'public'
