@@ -43,13 +43,42 @@ const fetchAsnPrefixes = async (asns) => {
   return [...new Set(ips)];
 };
 
+function ipToLong(ip) {
+  return ip.split('.').reduce((a, b) => (a << 8) + parseInt(b, 10), 0) >>> 0;
+}
+
+function ipv6ToBigInt(ip) {
+  let p = ip.split(':');
+  if (ip.includes('::')) {
+    const [f, s] = ip.split('::'), fP = f ? f.split(':') : [], sP = s ? s.split(':') : [];
+    p = [...fP, ...Array(8 - fP.length - sP.length).fill('0'), ...sP];
+  }
+  return p.reduce((a, b) => (a << 16n) + BigInt(parseInt(b || '0', 16)), 0n);
+}
+
+function prefixSortKey(cidr) {
+  const [ip] = cidr.split('/');
+  if (ip.includes(':')) {
+    try { return ipv6ToBigInt(ip); } catch (e) { return -1n; }
+  }
+  try { return BigInt(ipToLong(ip)); } catch (e) { return -1n; }
+}
+
 function sortPrefixes(list) {
-  return [...list].sort((a, b) => {
-    const aIsV6 = a.includes(':');
-    const bIsV6 = b.includes(':');
-    if (aIsV6 !== bIsV6) return aIsV6 ? 1 : -1;
-    return a.localeCompare(b);
+  const v4 = list.filter(c => !c.includes(':'));
+  const v6 = list.filter(c => c.includes(':'));
+
+  v4.sort((a, b) => {
+    const ka = prefixSortKey(a), kb = prefixSortKey(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
   });
+  v6.sort((a, b) => {
+    const ka = prefixSortKey(a), kb = prefixSortKey(b);
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+
+  // v4 在前，v6 在后，和之前的输出习惯保持一致
+  return [...v4, ...v6];
 }
 
 async function main() {
