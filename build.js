@@ -127,6 +127,19 @@ function sortPrefixes(list) {
   return [...v4, ...v6];
 }
 
+// 构建期自检：输出必须「每个协议族内数值严格升序且互不重叠」，否则 Worker 的二分查找会出错，直接中止构建
+function assertSortedDisjoint(list, label) {
+  const last = { v4: null, v6: null };
+  for (const cidr of list) {
+    const p = parseCidr(cidr);
+    const key = p.isV6 ? 'v6' : 'v4';
+    if (last[key] !== null && !(p.start > last[key].end)) {
+      throw new Error(`${label} 数据存在乱序或重叠: ${last[key].cidr} -> ${cidr}`);
+    }
+    last[key] = p;
+  }
+}
+
 async function main() {
   console.log('开始抓取 ASN 数据...');
   try {
@@ -147,6 +160,8 @@ async function main() {
 
     const sortedMeta = sortPrefixes(metaDeduped);
     const sortedCf = sortPrefixes(cfDeduped);
+    assertSortedDisjoint(sortedMeta, 'meta');
+    assertSortedDisjoint(sortedCf, 'cf');
 
     const resultData = {
       meta: sortedMeta,
