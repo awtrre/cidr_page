@@ -1,38 +1,12 @@
 const net = require('net');
 const crypto = require('crypto');
+const kv = require('./kv');
 
 const TARGETS = [{ key: 'meta_ech', host: 'www.facebook.com', port: 443 }];
 const ATTEMPTS = 3;
 const TIMEOUT_MS = 10000;
 const SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
 const EMPTY = Buffer.alloc(0);
-
-const { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CF_KV_NAMESPACE_ID } = process.env;
-if (!CLOUDFLARE_API_TOKEN || !CLOUDFLARE_ACCOUNT_ID || !CF_KV_NAMESPACE_ID) {
-  throw new Error('缺少 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID / CF_KV_NAMESPACE_ID');
-}
-
-const kvBase = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${CF_KV_NAMESPACE_ID}`;
-
-const kv = async (path, init = {}) => {
-  const res = await fetch(kvBase + path, {
-    ...init,
-    headers: { Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`, ...init.headers },
-    signal: AbortSignal.timeout(20000)
-  });
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`KV ${res.status}: ${await res.text()}`);
-  return res;
-};
-
-const kvGet = async key => (await kv(`/values/${encodeURIComponent(key)}`))?.text() ?? null;
-
-const kvPut = entries =>
-  kv('/bulk', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(entries)
-  });
 
 const u8 = n => Buffer.from([n]);
 const u16 = n => Buffer.from([n >> 8, n & 255]);
@@ -196,7 +170,8 @@ const sync = async ({ key, host, port }) => {
   const cfg = await probe(host, port);
   if (!isValid(cfg)) throw new Error(`${host} 未返回有效的 ECH 配置`);
   const config = cfg.toString('base64');
-  const current = JSON.parse((await kvGet(key)) ?? 'null');
+  const raw = await kv.read(key);
+  const current = raw && JSON.parse(Buffer.from(raw).toString());
   if (current?.config === config) return null;
   return { key, value: JSON.stringify({ host, config, updated_at: new Date().toISOString() }) };
 };
@@ -205,7 +180,7 @@ const sync = async ({ key, host, port }) => {
   const results = await Promise.allSettled(TARGETS.map(sync));
   results.forEach((r, i) => r.status === 'rejected' && console.error(`${TARGETS[i].key}: ${r.reason.message}`));
   const updates = results.flatMap(r => (r.status === 'fulfilled' && r.value ? [r.value] : []));
-  if (updates.length) await kvPut(updates);
+  if (updates.length) await kv.write(updates);
   console.log(`已更新 ${updates.length} 项`);
   if (results.some(r => r.status === 'rejected')) process.exitCode = 1;
 })().catch(e => {
