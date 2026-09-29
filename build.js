@@ -140,6 +140,23 @@ function assertSortedDisjoint(list, label) {
   }
 }
 
+async function putKv(key, value) {
+  const { CLOUDFLARE_API_TOKEN: token, CLOUDFLARE_ACCOUNT_ID: account, CF_KV_NAMESPACE_ID: ns } = process.env;
+  if (!token || !account || !ns) return console.log('::warning::未配置 KV 环境变量，跳过 KV 写入');
+  try {
+    const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/storage/kv/namespaces/${ns}/bulk`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify([{ key, value }]),
+      signal: AbortSignal.timeout(20000)
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+    console.log(`已写入 KV: ${key}`);
+  } catch (e) {
+    console.log(`::warning::KV 写入失败: ${e.message}`);
+  }
+}
+
 async function main() {
   console.log('开始抓取 ASN 数据...');
   try {
@@ -180,6 +197,8 @@ async function main() {
       path.join(outputDir, 'data.json'),
       JSON.stringify(resultData)
     );
+    await putKv('cidr_json', JSON.stringify(resultData));
+
     const headersContent = `
 /data.json
   Access-Control-Allow-Origin: *
