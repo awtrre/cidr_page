@@ -1,219 +1,162 @@
-const fs = require('fs');
-const path = require('path');
+const fs = require('node:fs');
+const path = require('node:path');
+const kv = require('./kv');
 
-const metaASNs = ['AS32934', 'AS54115', 'AS63293'];
-const cfASNs = ['AS13335', 'AS209242', 'AS132892'];
+const GROUPS = {
+  meta: ['AS32934', 'AS54115', 'AS63293'],
+  cf: ['AS13335', 'AS209242', 'AS132892']
+};
+const KV_KEY = 'cidr_bin';
+const MIN_KEEP_RATIO = 0.5;
+const HEADERS = [
+  '/data.json',
+  '  Access-Control-Allow-Origin: *',
+  '  Cache-Control: public, max-age=3600, stale-while-revalidate=86400',
+  '  Content-Type: application/json;charset=UTF-8'
+].join('\n');
 
-const FETCH_TIMEOUT_MS = 10000;
-const MAX_RETRIES = 3;
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
-async function fetchWithRetry(url, retries = MAX_RETRIES) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+const fetchJson = async (url, retries = 3) => {
+  for (let attempt = 1; ; attempt++) {
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-      if (res.ok) return res;
-      throw new Error(`HTTP ${res.status}`);
+      const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
     } catch (e) {
-      if (attempt === retries) throw e;
-      const backoff = 500 * attempt;
-      console.warn(`  请求失败 (第 ${attempt} 次): ${e.message}，${backoff}ms 后重试...`);
-      await new Promise(r => setTimeout(r, backoff));
+      if (attempt >= retries) throw new Error(`${url} 抓取失败: ${e.message}`);
+      await sleep(500 * attempt);
     }
   }
-}
-
-const fetchAsnPrefixes = async (asns) => {
-  const reqs = asns.map(asn =>
-    fetchWithRetry(`https://stat.ripe.net/data/announced-prefixes/data.json?resource=${asn}`)
-      .catch(e => {
-        console.error(`  ASN ${asn} 抓取彻底失败: ${e.message}`);
-        return null;
-      })
-  );
-  const responses = await Promise.all(reqs);
-
-  let ips = [];
-  for (const res of responses) {
-    if (res && res.ok) {
-      const data = await res.json();
-      const prefixes = data.data.prefixes.map(p => p.prefix);
-      ips.push(...prefixes);
-    }
-  }
-  return [...new Set(ips)];
 };
 
-// ==========================================
-// IP <-> 数值 转换（和 Worker 端保持完全一致的算法）
-// ==========================================
-function ipToLong(ip) {
-  return ip.split('.').reduce((a, b) => (a << 8) + parseInt(b, 10), 0) >>> 0;
-}
+const fetchPrefixes = async asns => {
+  const lists = await Promise.all(
+    asns.map(async asn => {
+      const json = await fetchJson(`https://stat.ripe.net/data/announced-prefixes/data.json?resource=${asn}`);
+      return json.data.prefixes.map(p => p.prefix);
+    })
+  );
+  return [...new Set(lists.flat())];
+};
 
-function ipv6ToBigInt(ip) {
-  let p = ip.split(':');
-  if (ip.includes('::')) {
-    const [f, s] = ip.split('::'), fP = f ? f.split(':') : [], sP = s ? s.split(':') : [];
-    p = [...fP, ...Array(8 - fP.length - sP.length).fill('0'), ...sP];
+const parseV4 = ip => ip.split('.').reduce((acc, octet) => (acc << 8n) | BigInt(octet), 0n);
+
+const parseV6 = ip => {
+  const [head, tail] = ip.split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail ? tail.split(':') : [];
+  const gap = tail === undefined ? [] : Array(8 - h.length - t.length).fill('0');
+  return [...h, ...gap, ...t].reduce((acc, group) => (acc << 16n) | BigInt(`0x${group || '0'}`), 0n);
+};
+
+const parse = cidr => {
+  const [ip, bits] = cidr.split('/');
+  const v6 = ip.includes(':');
+  const span = (1n << ((v6 ? 128n : 32n) - BigInt(bits))) - 1n;
+  const start = (v6 ? parseV6(ip) : parseV4(ip)) & ~span;
+  return { cidr, v6, len: Number(bits), start, end: start | span };
+};
+
+const prune = entries => {
+  const sorted = [...entries].sort((a, b) => cmp(a.start, b.start) || a.len - b.len);
+  const kept = [];
+  let covered = -1n;
+  for (const entry of sorted) {
+    if (entry.start <= covered) continue;
+    kept.push(entry);
+    covered = entry.end;
   }
-  return p.reduce((a, b) => (a << 16n) + BigInt(parseInt(b || '0', 16)), 0n);
-}
+  return kept;
+};
 
-function parseCidr(cidr) {
-  const isV6 = cidr.includes(':');
-  const [ip, bitsStr] = cidr.split('/');
-  const bits = parseInt(bitsStr, 10);
-  if (isV6) {
-    const mask = ~((1n << (128n - BigInt(bits))) - 1n);
-    const ipBn = ipv6ToBigInt(ip);
-    const start = ipBn & mask;
-    const end = start | ((1n << (128n - BigInt(bits))) - 1n);
-    return { cidr, isV6, start, end, prefixLen: bits };
-  } else {
-    const mask = ~((1 << (32 - bits)) - 1);
-    const ipNum = ipToLong(ip);
-    const start = (ipNum & mask) >>> 0;
-    const end = ((ipNum & mask) | ((1 << (32 - bits)) - 1)) >>> 0;
-    return { cidr, isV6, start, end, prefixLen: bits };
-  }
-}
+const compile = prefixes => {
+  const parsed = prefixes.map(parse);
+  const [v4, v6] = [false, true].map(isV6 => prune(parsed.filter(e => e.v6 === isV6)));
+  return { v4, v6 };
+};
 
-// ==========================================
-// 去掉被更大网段完全覆盖的冗余 CIDR。
-// 原理：两个合法的 CIDR 区间要么完全不相交，要么一个完全包含另一个，
-// 不可能出现"部分重叠"，所以排序后一次线性扫描即可清理干净。
-// 这一步同时解决了两个问题：
-//   1) 减小 data.json 体积（去掉冗余的更具体前缀）
-//   2) 让 Worker 端的二分查找结果正确 —— 如果留着嵌套的区间，
-//      二分查找只会检查"起始地址最靠后的那一个"，可能漏判被大网段
-//      覆盖、但不在任何具体子网段里的 IP。
-// ==========================================
-function removeContainedCidrs(cidrList) {
-  // v4 / v6 分开处理，避免 Number 与 BigInt 混合比较
-  const dedupeFamily = (list) => {
-    const parsed = list.map(parseCidr);
-    // 起始地址升序；起始地址相同则网段更大（prefixLen 更小）的排前面
-    parsed.sort((a, b) => {
-      if (a.start < b.start) return -1;
-      if (a.start > b.start) return 1;
-      return a.prefixLen - b.prefixLen;
-    });
-    const kept = [];
-    let coveredUntil = null;
-    for (const item of parsed) {
-      if (coveredUntil !== null && item.start <= coveredUntil) continue; // 已被更大网段覆盖
-      kept.push(item.cidr);
-      if (coveredUntil === null || item.end > coveredUntil) coveredUntil = item.end;
+const merge = ranges => {
+  const out = [];
+  for (const [start, end] of ranges) {
+    const last = out.at(-1);
+    if (last && start <= last[1] + 1n) {
+      if (end > last[1]) last[1] = end;
+    } else {
+      out.push([start, end]);
     }
-    return kept;
-  };
-  const v4 = cidrList.filter(c => !c.includes(':'));
-  const v6 = cidrList.filter(c => c.includes(':'));
-  return [...dedupeFamily(v4), ...dedupeFamily(v6)];
-}
-
-// 最终排序输出（v4 在前，v6 在后，且各自按数值升序）
-function sortPrefixes(list) {
-  const v4 = list.filter(c => !c.includes(':'));
-  const v6 = list.filter(c => c.includes(':'));
-
-  const byStart = (a, b) => {
-    const ka = parseCidr(a).start, kb = parseCidr(b).start;
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
-  };
-  v4.sort(byStart);
-  v6.sort(byStart);
-
-  return [...v4, ...v6];
-}
-
-// 构建期自检：输出必须「每个协议族内数值严格升序且互不重叠」，否则 Worker 的二分查找会出错，直接中止构建
-function assertSortedDisjoint(list, label) {
-  const last = { v4: null, v6: null };
-  for (const cidr of list) {
-    const p = parseCidr(cidr);
-    const key = p.isV6 ? 'v6' : 'v4';
-    if (last[key] !== null && !(p.start > last[key].end)) {
-      throw new Error(`${label} 数据存在乱序或重叠: ${last[key].cidr} -> ${cidr}`);
-    }
-    last[key] = p;
   }
-}
+  return out;
+};
 
-async function putKv(key, value) {
-  const { CLOUDFLARE_API_TOKEN: token, CLOUDFLARE_ACCOUNT_ID: account, CF_KV_NAMESPACE_ID: ns } = process.env;
-  if (!token || !account || !ns) return console.log('::warning::未配置 KV 环境变量，跳过 KV 写入');
-  try {
-    const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}/storage/kv/namespaces/${ns}/bulk`, {
-      method: 'PUT',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify([{ key, value }]),
-      signal: AbortSignal.timeout(20000)
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-    console.log(`已写入 KV: ${key}`);
-  } catch (e) {
-    console.log(`::warning::KV 写入失败: ${e.message}`);
-  }
-}
+const toRanges = ({ v4, v6 }) => ({
+  v4: merge(v4.map(e => [e.start, e.end])),
+  v6: merge(v6.map(e => [e.start >> 64n, e.end >> 64n]))
+});
 
-async function main() {
-  console.log('开始抓取 ASN 数据...');
-  try {
-    const [metaIpsRaw, cfIpsRaw] = await Promise.all([
-      fetchAsnPrefixes(metaASNs),
-      fetchAsnPrefixes(cfASNs)
-    ]);
+const encode = sections => {
+  const head = Uint32Array.from(sections.flatMap(s => [s.v4.length, s.v6.length]));
+  const arrays = sections.flatMap(({ v4, v6 }) => [
+    Uint32Array.from(v4, r => Number(r[0])),
+    Uint32Array.from(v4, r => Number(r[1])),
+    BigUint64Array.from(v6, r => r[0]),
+    BigUint64Array.from(v6, r => r[1])
+  ]);
+  return Buffer.concat([head, ...arrays].map(a => Buffer.from(a.buffer, a.byteOffset, a.byteLength)));
+};
 
-    if (metaIpsRaw.length === 0 || cfIpsRaw.length === 0) {
-      throw new Error(`抓取结果异常：meta=${metaIpsRaw.length} 条，cf=${cfIpsRaw.length} 条，为避免覆盖线上数据，构建中止`);
+const assertNotShrunk = async counts => {
+  const previous = await kv.read(KV_KEY);
+  if (!previous || previous.byteLength < 16) return;
+  const old = new Uint32Array(previous, 0, 4);
+  counts.forEach((count, i) => {
+    if (count < old[i] * MIN_KEEP_RATIO) {
+      throw new Error(`数据异常缩水，已中止写入: 第 ${i} 段 ${old[i]} -> ${count}`);
     }
+  });
+};
 
-    const metaDeduped = removeContainedCidrs(metaIpsRaw);
-    const cfDeduped = removeContainedCidrs(cfIpsRaw);
-
-    console.log(`meta: 抓取 ${metaIpsRaw.length} 条 -> 去重后 ${metaDeduped.length} 条`);
-    console.log(`cf:   抓取 ${cfIpsRaw.length} 条 -> 去重后 ${cfDeduped.length} 条`);
-
-    const sortedMeta = sortPrefixes(metaDeduped);
-    const sortedCf = sortPrefixes(cfDeduped);
-    assertSortedDisjoint(sortedMeta, 'meta');
-    assertSortedDisjoint(sortedCf, 'cf');
-
-    const resultData = {
-      meta: sortedMeta,
-      cf: sortedCf,
-      meta_count: sortedMeta.length,
-      cf_count: sortedCf.length,
+const publish = (meta, cf) => {
+  const dir = path.join(__dirname, 'public');
+  const list = ({ v4, v6 }) => [...v4, ...v6].map(e => e.cidr);
+  const [metaList, cfList] = [meta, cf].map(list);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'data.json'),
+    JSON.stringify({
+      meta: metaList,
+      cf: cfList,
+      meta_count: metaList.length,
+      cf_count: cfList.length,
       updated_at: new Date().toISOString()
-    };
+    })
+  );
+  fs.writeFileSync(path.join(dir, '_headers'), HEADERS);
+  fs.writeFileSync(path.join(dir, '_redirects'), '/ /data.json 301');
+};
 
-    const outputDir = path.join(__dirname, 'public');
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir);
-    }
+const main = async () => {
+  const [meta, cf] = await Promise.all(
+    [GROUPS.meta, GROUPS.cf].map(async asns => compile(await fetchPrefixes(asns)))
+  );
+  const sections = [meta, cf].map(toRanges);
+  const counts = sections.flatMap(s => [s.v4.length, s.v6.length]);
 
-    fs.writeFileSync(
-      path.join(outputDir, 'data.json'),
-      JSON.stringify(resultData)
-    );
-    await putKv('cidr_json', JSON.stringify(resultData));
+  if (!counts[0] || !counts[2]) throw new Error(`IPv4 网段为空，已中止写入: ${counts}`);
+  await assertNotShrunk(counts);
 
-    const headersContent = `
-/data.json
-  Access-Control-Allow-Origin: *
-  Cache-Control: public, max-age=3600, stale-while-revalidate=86400
-  Content-Type: application/json;charset=UTF-8
-`;
-    fs.writeFileSync(path.join(outputDir, '_headers'), headersContent.trim());
+  await kv.write([{ key: KV_KEY, value: encode(sections).toString('base64'), base64: true }]);
+  publish(meta, cf);
 
-    fs.writeFileSync(path.join(outputDir, '_redirects'), '/ /data.json 301');
+  console.log(`meta v4/v6: ${counts[0]}/${counts[1]}, cf v4/v6: ${counts[2]}/${counts[3]}`);
+};
 
-    console.log(`数据抓取及 CF Pages 配置文件生成完成！(meta: ${sortedMeta.length} 条, cf: ${sortedCf.length} 条)`);
-  } catch (error) {
-    console.error('抓取失败:', error);
+if (require.main === module) {
+  main().catch(e => {
+    console.error(e);
     process.exit(1);
-  }
+  });
 }
 
-main();
+module.exports = { compile, toRanges, encode };
