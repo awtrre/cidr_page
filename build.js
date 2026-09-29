@@ -7,6 +7,7 @@ const GROUPS = {
   cf: ['AS13335', 'AS209242', 'AS132892']
 };
 const KV_KEY = 'cidr_ranges';
+const ECH_KV_KEY = 'meta_ech';
 const MIN_KEEP_RATIO = 0.5;
 const HEADERS = [
   '/data.json',
@@ -117,7 +118,12 @@ const assertNotShrunk = async counts => {
   });
 };
 
-const publish = (meta, cf) => {
+const readMetaEch = async () => {
+  const raw = await kv.read(ECH_KV_KEY);
+  return raw && JSON.parse(Buffer.from(raw).toString());
+};
+
+const publish = (meta, cf, ech) => {
   const dir = path.join(__dirname, 'public');
   const list = ({ v4, v6 }) => [...v4, ...v6].map(e => e.cidr);
   const [metaList, cfList] = [meta, cf].map(list);
@@ -129,6 +135,8 @@ const publish = (meta, cf) => {
       cf: cfList,
       meta_count: metaList.length,
       cf_count: cfList.length,
+      meta_ech: ech?.config ?? null,
+      meta_ech_updated_at: ech?.updated_at ?? null,
       updated_at: new Date().toISOString()
     })
   );
@@ -145,9 +153,10 @@ const main = async () => {
 
   if (!counts[0] || !counts[2]) throw new Error(`IPv4 网段为空，已中止写入: ${counts}`);
   await assertNotShrunk(counts);
+  const ech = await readMetaEch();
 
   await kv.write([{ key: KV_KEY, value: encode(sections).toString('base64'), base64: true }]);
-  publish(meta, cf);
+  publish(meta, cf, ech);
 
   console.log(`meta v4/v6: ${counts[0]}/${counts[1]}, cf v4/v6: ${counts[2]}/${counts[3]}`);
 };
