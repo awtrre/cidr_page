@@ -6,7 +6,7 @@ const GROUPS = {
   meta: ['AS32934', 'AS54115', 'AS63293'],
   cf: ['AS13335', 'AS209242', 'AS132892']
 };
-const KV_KEY = 'cidr_bin';
+const KV_KEY = 'cidr_ranges';
 const MIN_KEEP_RATIO = 0.5;
 const HEADERS = [
   '/data.json',
